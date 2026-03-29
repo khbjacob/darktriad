@@ -1,182 +1,399 @@
 import os
+import json
+import base64
 import time
-import uuid
-from datetime import datetime
-from flask import Flask, request, jsonify, send_file
+from functools import wraps
+
+import anthropic
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-from werkzeug.utils import secure_filename
-import logging
-from pathlib import Path
+from supabase import create_client
 
-from facial_analyzer import FacialAnalyzer
-from trait_predictor import TraitPredictor
-from pdf_generator import generate_analysis_pdf
-
-# Initialize Flask app
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=os.environ.get("ALLOWED_ORIGINS", "*").split(","))
 
-# Configuration
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB max file size
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'webp'}
+# Clients
+claude = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+supabase_client = None
+if os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_SERVICE_KEY"):
+    supabase_client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 
-# Create upload folder
-Path(app.config['UPLOAD_FOLDER']).mkdir(exist_ok=True)
-
-# Rate limiting
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=["100 per day", "20 per hour"],
-    storage_uri="memory://",
-)
-
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Initialize ML components
-facial_analyzer = FacialAnalyzer()
-trait_predictor = TraitPredictor()
+# Simple rate limiting (use Redis in production)
+rate_limits = {}
 
 
-def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+def rate_limit(max_per_hour=20):
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            ip = request.remote_addr
+            now = time.time()
+            if ip not in rate_limits:
+                rate_limits[ip] = []
+            rate_limits[ip] = [t for t in rate_limits[ip] if now - t < 3600]
+            if len(rate_limits[ip]) >= max_per_hour:
+                return jsonify({"error": "Rate limit exceeded. Try again later."}), 429
+            rate_limits[ip].append(now)
+            return f(*args, **kwargs)
+        return decorated
+    return decorator
 
 
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat(),
-        'version': '1.0.0'
-    })
+SYSTEM_PROMPT = """You are a facial morphology and behavioral analysis system operating across five integrated frameworks:
+
+1. STRUCTURAL MORPHOLOGY — Measure facial proportions, ratios, bone structure. Report fWHR, symmetry, jaw definition, brow ridge, eye characteristics, nose, lips, cheekbones, forehead, chin. Use anthropometric principles.
+
+2. EKMAN'S FACS (Facial Action Coding System) — Analyze tonic (resting-state) Action Unit activation. In a "neutral" photograph, which facial muscles show chronic activation? This reveals habitual emotional patterns etched into the face over years. Key AUs for static analysis: AU1 (inner brow raise = chronic worry), AU4 (brow lower = chronic anger/concentration), AU1+4 (distress — hardest to fake), AU6 (crow's feet = genuine smile history), AU7 (lid tighten = chronic vigilance), AU12 asymmetry (contempt — the only asymmetric universal expression), AU15 (lip corner depress = chronic sadness), AU17 (chin raise = defiance/held-back crying), AU23/24 (lip tighten/press = suppressed anger, unsaid words). Report the Duchenne Signature: crow's feet depth vs. nasolabial depth reveals genuine positive affect history vs. social performance history.
+
+3. LOWEN'S BODY ARMOR — Analyze chronic muscular tension patterns visible in the face. Where someone holds tension tells you what they chronically hold back. Jaw armor = held anger, unsaid words. Brow/forehead armor = chronic vigilance, effortful control. Periorbital armor = emotional containment. Mouth/lip armor = suppressed communication. Connect armor patterns to Walker's 4F trauma responses where visible.
+
+4. NAVARRO'S BASELINE — Is this face at rest in comfort or discomfort? Read the overall comfort-discomfort signature. Apply the gravity-defying principle: upward features (raised brows, upturned mouth) = positive affect history; downward features = negative affect history. This face's resting state IS this person's nervous system baseline.
+
+5. HUGHES' DIPE — Detect (raw observations, no interpretation), then Interpret (map to behavioral hypotheses), then Predict (what behavioral patterns would you expect?). Integrate into the behavioral_hypothesis section.
+
+CRITICAL RULES:
+- You are measuring what you SEE. Report observable features first, then interpret.
+- Structural features (bone) are separate from muscular features (life history). Name which is which.
+- Use "research suggests," "clinical patterns indicate," or "this face communicates" — never "this person IS."
+- Be honest about confidence. Poor lighting, angle, or expression reduce what you can reliably assess.
+- The research_integrity section MUST honestly separate strong evidence from clinical observation from speculation.
+- The behavioral_hypothesis section is for a trained profiler. Write it as one professional to another. No fortune cookies. No flattery. Honest, specific, useful.
+- If the photo is insufficient for reliable analysis, say so clearly.
+- The somatic_armor_analysis is clinical pattern recognition (Lowen, Reich), not statistical research. Label it accurately in research_integrity.
+- When structural and muscular patterns contradict each other (e.g., dominant bone structure + submissive expression), NAME the contradiction — that's where the interesting information lives.
+
+Return ONLY valid JSON matching this structure:
+
+{
+  "photo_quality": {
+    "lighting": "good|adequate|poor",
+    "angle": "frontal|slight_turn|significant_turn",
+    "expression": "neutral|slight_expression|strong_expression",
+    "resolution": "high|adequate|low",
+    "overall_confidence": 0.0-1.0,
+    "issues": ["list of problems reducing reliability"],
+    "usable_for": {
+      "structural_analysis": true/false,
+      "muscular_analysis": true/false,
+      "expression_baseline": true/false
+    }
+  },
+  "structural_morphology": {
+    "face_shape": {
+      "classification": "oval|round|square|heart|oblong|diamond|triangle",
+      "confidence": 0.0-1.0,
+      "notes": "string"
+    },
+    "fwhr": {
+      "estimated_value": "float",
+      "classification": "low (<1.8)|average (1.8-2.1)|high (>2.1)",
+      "confidence": 0.0-1.0,
+      "research_note": "string",
+      "caveat": "string|null"
+    },
+    "symmetry": {
+      "assessment": "high|moderate|low",
+      "notable_asymmetries": ["list specific asymmetries observed"],
+      "confidence": 0.0-1.0,
+      "research_note": "string",
+      "caveat": "string|null"
+    },
+    "jaw_definition": {
+      "assessment": "string description",
+      "masseter_development": "minimal|moderate|significant",
+      "mandibular_angle": "narrow|average|wide",
+      "confidence": 0.0-1.0,
+      "research_note": "string",
+      "caveat": "string|null"
+    },
+    "brow_ridge": {
+      "assessment": "string",
+      "confidence": 0.0-1.0,
+      "research_note": "string"
+    },
+    "eye_characteristics": {
+      "spacing": "close|average|wide",
+      "opening": "narrow|average|wide",
+      "orbital_depth": "shallow|average|deep",
+      "confidence": 0.0-1.0,
+      "research_note": "string"
+    },
+    "nose_proportions": {
+      "assessment": "string",
+      "confidence": 0.0-1.0,
+      "research_note": "string"
+    },
+    "lip_proportions": {
+      "upper_lower_ratio": "string",
+      "overall_fullness": "thin|moderate|full",
+      "confidence": 0.0-1.0,
+      "research_note": "string"
+    },
+    "cheekbone_prominence": {
+      "assessment": "flat|moderate|prominent",
+      "confidence": 0.0-1.0,
+      "research_note": "string"
+    },
+    "forehead_ratio": {
+      "assessment": "low|average|high",
+      "confidence": 0.0-1.0,
+      "research_note": "string"
+    },
+    "chin_shape": {
+      "projection": "receding|average|prominent",
+      "width": "narrow|average|wide",
+      "confidence": 0.0-1.0,
+      "research_note": "string"
+    },
+    "feature_harmony": {
+      "score": 0.0-1.0,
+      "notes": "string",
+      "golden_ratio_proximity": "string"
+    }
+  },
+  "somatic_armor_analysis": {
+    "description": "Analysis of chronic muscular tension patterns visible in the face — where the body armor lives. Based on Lowen's bioenergetic framework and FACS tonic activation patterns.",
+    "jaw_armor": {
+      "present": true/false,
+      "severity": "none|mild|moderate|significant",
+      "indicators": ["list visible indicators"],
+      "interpretation": "string",
+      "walker_4f_association": "fight|flight|freeze|fawn|mixed"
+    },
+    "brow_forehead_armor": {
+      "present": true/false,
+      "severity": "none|mild|moderate|significant",
+      "indicators": ["list"],
+      "interpretation": "string"
+    },
+    "periorbital_armor": {
+      "present": true/false,
+      "severity": "none|mild|moderate|significant",
+      "indicators": ["list"],
+      "interpretation": "string"
+    },
+    "mouth_lip_armor": {
+      "present": true/false,
+      "severity": "none|mild|moderate|significant",
+      "indicators": ["list"],
+      "interpretation": "string"
+    },
+    "neck_throat_visible": {
+      "present": true/false,
+      "indicators": ["list if visible"],
+      "interpretation": "string"
+    },
+    "overall_armor_pattern": {
+      "primary_zone": "string",
+      "secondary_zone": "string",
+      "narrative": "string"
+    }
+  },
+  "expression_baseline_facs": {
+    "description": "FACS-informed analysis of tonic (resting-state) muscle activation patterns visible in this photograph.",
+    "tonic_aus_detected": [
+      {
+        "au": "AU number",
+        "name": "muscle name",
+        "intensity": "trace|slight|marked",
+        "confidence": 0.0-1.0,
+        "habitual_emotion_association": "string"
+      }
+    ],
+    "duchenne_history": {
+      "crow_feet_development": "minimal|moderate|deep",
+      "nasolabial_development": "minimal|moderate|deep",
+      "interpretation": "string"
+    },
+    "contempt_marker": {
+      "asymmetric_au12": true/false,
+      "side": "left|right|none",
+      "confidence": 0.0-1.0,
+      "interpretation": "string"
+    },
+    "habitual_emotional_signature": {
+      "primary_emotion": "string",
+      "secondary_emotion": "string",
+      "suppressed_emotion": "string",
+      "narrative": "string"
+    }
+  },
+  "perceived_age_analysis": {
+    "structural_age_markers": "string",
+    "somatic_age_markers": "string",
+    "overall_assessment": "string"
+  },
+  "behavioral_hypothesis": {
+    "description": "Synthesized behavioral profile integrating all five analytical pillars.",
+    "first_six_seconds": "string",
+    "structural_temperament": "string",
+    "emotional_history": "string",
+    "social_signal": "string",
+    "armor_narrative": "string",
+    "potential_blindspot": "string",
+    "navarro_comfort_baseline": "string",
+    "walker_4f_hypothesis": "string",
+    "profiler_notes": "string"
+  },
+  "research_integrity": {
+    "strong_correlations": ["list"],
+    "moderate_correlations": ["list"],
+    "clinical_pattern_recognition": ["list"],
+    "speculative": ["list"]
+  }
+}
+
+No markdown wrapping. No explanation outside the JSON."""
+
+USER_PROMPT = """Analyze this photograph using all five frameworks (structural morphology, Ekman FACS tonic activation, Lowen body armor, Navarro comfort baseline, Hughes DIPE). Return the complete JSON analysis structure as specified in your instructions. Be thorough, be honest, be specific."""
 
 
-@app.route('/api/analyze', methods=['POST'])
-@limiter.limit("5 per minute")
-def analyze_face():
-    """
-    Main endpoint for facial analysis
-    Accepts an image file and returns comprehensive analysis results
-    """
-    start_time = time.time()
+@app.route("/api/analyze", methods=["POST"])
+@rate_limit(max_per_hour=20)
+def analyze():
+    data = request.json
+    if not data or "image" not in data:
+        return jsonify({"error": "No image provided"}), 400
 
-    # Validate request
-    if 'image' not in request.files:
-        return jsonify({'error': 'No image file provided'}), 400
+    image_data = data["image"]
 
-    file = request.files['image']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
+    # Strip data URL prefix
+    if "," in image_data:
+        image_data = image_data.split(",", 1)[1]
 
-    if not allowed_file(file.filename):
-        return jsonify({'error': 'Invalid file type. Allowed: PNG, JPG, JPEG, WebP'}), 400
+    # Validate
+    try:
+        decoded = base64.b64decode(image_data)
+        max_size = int(os.environ.get("MAX_IMAGE_SIZE_MB", 10)) * 1024 * 1024
+        if len(decoded) > max_size:
+            return jsonify({"error": f"Image exceeds {os.environ.get('MAX_IMAGE_SIZE_MB', 10)}MB limit"}), 400
+    except Exception:
+        return jsonify({"error": "Invalid image data"}), 400
+
+    # Detect media type
+    media_type = "image/jpeg"
+    if decoded[:8] == b'\x89PNG\r\n\x1a\n':
+        media_type = "image/png"
+    elif decoded[:4] == b'RIFF' and decoded[8:12] == b'WEBP':
+        media_type = "image/webp"
 
     try:
-        # Save file temporarily
-        filename = secure_filename(f"{uuid.uuid4()}_{file.filename}")
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=8192,
+            system=SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": image_data
+                        }
+                    },
+                    {"type": "text", "text": USER_PROMPT}
+                ]
+            }]
+        )
 
-        logger.info(f"Processing image: {filename}")
+        raw_text = response.content[0].text
 
-        # Step 1: Facial analysis
-        facial_measurements = facial_analyzer.analyze(filepath)
-        if facial_measurements is None:
-            return jsonify({'error': 'No face detected in the image. Please ensure the face is clearly visible.'}), 400
+        # Clean markdown fencing if present
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
 
-        # Step 2: Trait prediction
-        trait_predictions = trait_predictor.predict(facial_measurements)
+        analysis = json.loads(cleaned)
 
-        # Step 3: Calculate overall confidence
-        all_confidences = []
-        for trait_list in [trait_predictions['bigFive'], trait_predictions['darkTriad'], trait_predictions['otherTraits']]:
-            all_confidences.extend([t.get('confidence', 0.5) for t in trait_list])
-        overall_confidence = sum(all_confidences) / len(all_confidences) if all_confidences else 0.5
+        # Store if user authenticated and Supabase is configured
+        user_id = data.get("user_id")
+        stored_id = None
+        if user_id and supabase_client:
+            result = supabase_client.table("analyses").insert({
+                "user_id": user_id,
+                "analysis": analysis,
+                "photo_quality_score": analysis.get("photo_quality", {}).get("overall_confidence", 0)
+            }).execute()
+            stored_id = result.data[0]["id"] if result.data else None
 
-        # Construct response
-        processing_time = time.time() - start_time
-        analysis_id = str(uuid.uuid4())
+        return jsonify({"analysis": analysis, "id": stored_id})
 
-        result = {
-            'id': analysis_id,
-            'timestamp': datetime.utcnow().isoformat(),
-            'facialMeasurements': facial_measurements,
-            'bigFive': trait_predictions['bigFive'],
-            'darkTriad': trait_predictions['darkTriad'],
-            'otherTraits': trait_predictions['otherTraits'],
-            'overallConfidence': overall_confidence,
-            'processingTime': processing_time,
-        }
-
-        logger.info(f"Analysis completed in {processing_time:.2f}s")
-
-        return jsonify(result), 200
-
+    except json.JSONDecodeError:
+        return jsonify({
+            "error": "Analysis returned non-JSON response",
+            "raw_preview": raw_text[:500] if raw_text else "empty"
+        }), 500
+    except anthropic.APIError as e:
+        return jsonify({"error": f"Claude API error: {str(e)}"}), 500
     except Exception as e:
-        logger.error(f"Error during analysis: {str(e)}", exc_info=True)
-        return jsonify({'error': f'Analysis failed: {str(e)}'}), 500
-
-    finally:
-        # Clean up uploaded file
-        if os.path.exists(filepath):
-            try:
-                os.remove(filepath)
-            except Exception as e:
-                logger.warning(f"Failed to remove temp file: {e}")
+        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
 
 
-@app.route('/api/analysis/<analysis_id>/pdf', methods=['GET'])
-@limiter.limit("10 per minute")
-def export_pdf(analysis_id):
-    """
-    Export analysis results as PDF
-    """
-    try:
-        # In a real app, retrieve analysis from database
-        # For now, return a placeholder error
-        return jsonify({'error': 'PDF export requires analysis to be saved first'}), 501
-
-    except Exception as e:
-        logger.error(f"PDF export error: {str(e)}")
-        return jsonify({'error': 'PDF generation failed'}), 500
+@app.route("/api/analysis/<analysis_id>", methods=["GET"])
+def get_analysis(analysis_id):
+    if not supabase_client:
+        return jsonify({"error": "Database not configured"}), 503
+    result = supabase_client.table("analyses").select("*").eq("id", analysis_id).execute()
+    if not result.data:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(result.data[0])
 
 
-@app.route('/api/history', methods=['GET'])
-def get_history():
-    """
-    Get analysis history for authenticated user
-    """
-    # TODO: Implement user authentication and database retrieval
-    return jsonify([]), 200
+@app.route("/api/analyses", methods=["GET"])
+def list_analyses():
+    if not supabase_client:
+        return jsonify({"error": "Database not configured"}), 503
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"error": "user_id required"}), 400
+    result = (supabase_client.table("analyses")
+              .select("id, created_at, photo_quality_score, analysis->structural_morphology->face_shape->classification")
+              .eq("user_id", user_id)
+              .order("created_at", desc=True)
+              .limit(50)
+              .execute())
+    return jsonify(result.data)
 
 
-@app.errorhandler(429)
-def ratelimit_handler(e):
-    """Handle rate limit exceeded"""
-    return jsonify({
-        'error': 'Rate limit exceeded',
-        'message': 'Too many requests. Please try again later.'
-    }), 429
+@app.route("/api/analysis/<analysis_id>", methods=["DELETE"])
+def delete_analysis(analysis_id):
+    if not supabase_client:
+        return jsonify({"error": "Database not configured"}), 503
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"error": "user_id required"}), 400
+    supabase_client.table("analyses").delete().eq("id", analysis_id).eq("user_id", user_id).execute()
+    return jsonify({"deleted": True})
 
 
-@app.errorhandler(413)
-def too_large(e):
-    """Handle file too large"""
-    return jsonify({
-        'error': 'File too large',
-        'message': 'File size must be less than 10MB'
-    }), 413
+@app.route("/api/compare", methods=["POST"])
+def compare():
+    if not supabase_client:
+        return jsonify({"error": "Database not configured"}), 503
+    data = request.json
+    ids = data.get("analysis_ids", [])
+    if len(ids) != 2:
+        return jsonify({"error": "Exactly 2 analysis IDs required"}), 400
+    results = []
+    for aid in ids:
+        r = supabase_client.table("analyses").select("*").eq("id", aid).execute()
+        if r.data:
+            results.append(r.data[0])
+    if len(results) != 2:
+        return jsonify({"error": "One or both not found"}), 404
+    return jsonify({"analyses": results})
 
 
-if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "version": "2.0"})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG", "false").lower() == "true")

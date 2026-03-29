@@ -1,94 +1,66 @@
-# PersonaScope - Facial Feature & Trait Analysis Platform
+# PersonaScope
 
-**⚠️ CRITICAL DISCLAIMER: This application is for entertainment and educational purposes only. Facial analysis of personality traits is not scientifically validated for individual prediction and should NEVER be used for hiring, dating decisions, or judging others.**
+Facial morphology analysis platform operating across five integrated frameworks:
 
-## Overview
+1. **Structural Morphology** — Bone structure, proportions, ratios (fWHR, symmetry, jaw, forehead)
+2. **Ekman FACS** — Tonic Action Unit activation revealing habitual emotional patterns
+3. **Lowen Body Armor** — Chronic muscular tension patterns and what they hold back
+4. **Navarro Baseline** — Comfort-discomfort signature and gravity-defying principle
+5. **Hughes DIPE** — Detect, Interpret, Predict behavioral profiling pipeline
 
-PersonaScope is a research-oriented web application that explores statistical correlations between facial features and personality traits as reported in psychological research literature. The application emphasizes scientific rigor, transparency about limitations, and ethical usage.
-
-## Purpose
-
-- **Educational**: Demonstrate facial analysis techniques and psychological research
-- **Exploratory**: Allow users to explore research-suggested correlations
-- **Entertainment**: Provide engaging self-exploration experience
-- **NOT Diagnostic**: This is not a validated psychological assessment tool
-
-## Key Features
-
-### Facial Feature Detection
-- Facial width-to-height ratio (fWHR) measurement
-- Facial symmetry analysis
-- Eyebrow positioning and thickness detection
-- Jaw prominence and facial structure analysis
-- Eye shape, spacing, and characteristics
-- Lip fullness and mouth width analysis
-
-### Trait Correlation Analysis
-- Research-based correlation indicators (not deterministic predictions)
-- Big Five personality approximations
-- Confidence intervals and statistical significance
-- Links to peer-reviewed research papers
-- Comprehensive limitations documentation
-
-### Privacy & Security
-- Client-side processing where possible
-- Immediate image deletion after analysis
-- No facial data retention
-- GDPR/CCPA compliant
-- Rate limiting and abuse prevention
-
-## Technical Stack
+## Stack
 
 - **Frontend**: React + TypeScript + Vite
-- **Backend**: Python Flask + OpenCV + dlib/MediaPipe
-- **Database**: Supabase (user auth and analysis history)
-- **ML**: TensorFlow/PyTorch for trait prediction models
-- **Hosting**: Frontend on Vercel, Backend on Railway/Render
+- **Backend**: Python Flask
+- **AI Engine**: Anthropic Claude API (claude-sonnet-4-20250514) with vision
+- **Database**: Supabase (auth + analysis storage)
+- **Deploy**: Backend on Railway, Frontend on Vercel
 
-## Project Structure
+## Quick Start
 
+### Backend
+
+```bash
+cd backend
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env  # fill in ANTHROPIC_API_KEY + Supabase creds
+python app.py
 ```
-personascope/
-├── frontend/           # React + TypeScript frontend
-├── backend/            # Python Flask API
-├── docs/               # Documentation and research citations
-└── README.md           # This file
+
+### Frontend
+
+```bash
+cd frontend
+npm install
+cp .env.example .env  # fill in API URL + Supabase creds
+npm run dev
 ```
 
-## Ethical Guidelines
+### Database
 
-This application is built with strict ethical safeguards:
+Run `supabase/schema.sql` against your Supabase project.
 
-1. **Mandatory Disclaimers**: Users must acknowledge limitations before use
-2. **Research Transparency**: All claims linked to peer-reviewed research
-3. **Probabilistic Framing**: Results shown as correlations, not certainties
-4. **No Misuse**: Usage monitoring to detect discrimination patterns
-5. **Watermarked Results**: All outputs marked "NOT FOR DECISION-MAKING"
+## How It Works
 
-## Scientific Approach
+1. User uploads a frontal photograph
+2. Image is sent as base64 to the Flask backend
+3. Backend sends image + comprehensive system prompt to Claude Vision API
+4. Claude analyzes across all 5 frameworks and returns structured JSON
+5. Frontend renders the analysis across tabbed panels (Profile, Structure, Armor, Expression, Research)
+6. Image is never stored — analysis JSON is optionally saved for authenticated users
 
-- All trait correlations presented as "research suggests" or "studies indicate"
-- Confidence intervals and p-values displayed
-- Comprehensive limitations section for each trait
-- Population-level statistics, not individual predictions
-- Regular updates based on latest research
+## Architecture
 
-## Getting Started
+Claude Vision replaces all traditional CV/ML libraries (OpenCV, dlib, MediaPipe, TensorFlow). One API call that understands *context*, not just landmarks.
 
-See `/docs/SETUP.md` for development setup instructions.
+The system prompt (in `backend/app.py`) is the core intellectual property. It instructs Claude to:
+- Measure structural proportions
+- Read tonic FACS activation patterns
+- Map somatic armor zones
+- Establish comfort/discomfort baseline
+- Synthesize a behavioral hypothesis
 
-## Research Citations
+## Disclaimer
 
-See `/docs/RESEARCH.md` for comprehensive list of peer-reviewed studies and methodological limitations.
-
-## License
-
-MIT License - See LICENSE file for details
-
-## Ethics & Usage Policy
-
-See `/docs/ETHICS.md` for detailed usage policy and ethical considerations.
-
----
-
-**Remember**: This tool explores statistical correlations reported in research literature. It does not and cannot accurately predict individual personality traits. Treat results as educational entertainment, not scientific fact.
+PersonaScope maps facial structure against published research and clinical observation frameworks. Structural measurements reflect population-level statistical patterns, not individual certainties. Muscular analysis draws on clinical traditions (bioenergetics, somatic psychology) that are therapeutically validated but not statistically controlled in the way morphometric research is. Use this as a starting point for observation and hypothesis, not as a conclusion about who someone is.
