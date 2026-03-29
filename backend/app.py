@@ -4,23 +4,32 @@ import base64
 import time
 from functools import wraps
 
-import anthropic
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from supabase import create_client
 
 app = Flask(__name__)
 CORS(app, origins=os.environ.get("ALLOWED_ORIGINS", "*").split(","))
 
-# Clients
-claude = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+# Initialize clients only if credentials exist
+anthropic_client = None
 supabase_client = None
-if os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_SERVICE_KEY"):
-    supabase_client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
 
-# Simple rate limiting (use Redis in production)
+try:
+    import anthropic
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+except Exception as e:
+    print(f"Claude API not configured: {e}")
+
+try:
+    from supabase import create_client
+    if os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_SERVICE_KEY"):
+        supabase_client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+except Exception as e:
+    print(f"Supabase not configured: {e}")
+
+# Simple rate limiting
 rate_limits = {}
-
 
 def rate_limit(max_per_hour=20):
     def decorator(f):
@@ -248,20 +257,31 @@ No markdown wrapping. No explanation outside the JSON."""
 USER_PROMPT = """Analyze this photograph using all five frameworks (structural morphology, Ekman FACS tonic activation, Lowen body armor, Navarro comfort baseline, Hughes DIPE). Return the complete JSON analysis structure as specified in your instructions. Be thorough, be honest, be specific."""
 
 
+@app.route("/api/health", methods=["GET"])
+def health():
+    """Health check - always succeeds"""
+    return jsonify({
+        "status": "ok",
+        "version": "2.0",
+        "claude_configured": anthropic_client is not None,
+        "supabase_configured": supabase_client is not None
+    })
+
+
 @app.route("/api/analyze", methods=["POST"])
 @rate_limit(max_per_hour=20)
 def analyze():
+    if not anthropic_client:
+        return jsonify({"error": "ANTHROPIC_API_KEY not configured"}), 503
+
     data = request.json
     if not data or "image" not in data:
         return jsonify({"error": "No image provided"}), 400
 
     image_data = data["image"]
-
-    # Strip data URL prefix
     if "," in image_data:
         image_data = image_data.split(",", 1)[1]
 
-    # Validate
     try:
         decoded = base64.b64decode(image_data)
         max_size = int(os.environ.get("MAX_IMAGE_SIZE_MB", 10)) * 1024 * 1024
@@ -270,7 +290,6 @@ def analyze():
     except Exception:
         return jsonify({"error": "Invalid image data"}), 400
 
-    # Detect media type
     media_type = "image/jpeg"
     if decoded[:8] == b'\x89PNG\r\n\x1a\n':
         media_type = "image/png"
@@ -278,7 +297,7 @@ def analyze():
         media_type = "image/webp"
 
     try:
-        response = claude.messages.create(
+        response = anthropic_client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=8192,
             system=SYSTEM_PROMPT,
@@ -299,8 +318,6 @@ def analyze():
         )
 
         raw_text = response.content[0].text
-
-        # Clean markdown fencing if present
         cleaned = raw_text.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
@@ -310,7 +327,6 @@ def analyze():
 
         analysis = json.loads(cleaned)
 
-        # Store if user authenticated and Supabase is configured
         user_id = data.get("user_id")
         stored_id = None
         if user_id and supabase_client:
@@ -326,12 +342,10 @@ def analyze():
     except json.JSONDecodeError:
         return jsonify({
             "error": "Analysis returned non-JSON response",
-            "raw_preview": raw_text[:500] if raw_text else "empty"
+            "raw_preview": raw_text[:500] if 'raw_text' in locals() else "empty"
         }), 500
-    except anthropic.APIError as e:
-        return jsonify({"error": f"Claude API error: {str(e)}"}), 500
     except Exception as e:
-        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
+        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
 
 
 @app.route("/api/analysis/<analysis_id>", methods=["GET"])
@@ -352,7 +366,7 @@ def list_analyses():
     if not user_id:
         return jsonify({"error": "user_id required"}), 400
     result = (supabase_client.table("analyses")
-              .select("id, created_at, photo_quality_score, analysis->structural_morphology->face_shape->classification")
+              .select("id, created_at, photo_quality_score")
               .eq("user_id", user_id)
               .order("created_at", desc=True)
               .limit(50)
@@ -389,11 +403,9 @@ def compare():
     return jsonify({"analyses": results})
 
 
-@app.route("/api/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "version": "2.0"})
-
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG", "false").lower() == "true")
+    print(f"Starting PersonaScope on port {port}")
+    print(f"Claude configured: {anthropic_client is not None}")
+    print(f"Supabase configured: {supabase_client is not None}")
+    app.run(host="0.0.0.0", port=port)
